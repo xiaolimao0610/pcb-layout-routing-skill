@@ -1,0 +1,7 @@
+{
+  "options": {
+    "routing": {
+      "via_in_pad_penalty": 120
+    }
+  }
+}

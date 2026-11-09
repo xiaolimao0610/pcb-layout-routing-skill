@@ -1,0 +1,42 @@
+{
+  "options": {
+    "placement": {
+      "method": "analytic_sa",
+      "initialization": "auto",
+      "seed": 0,
+      "max_seconds": 30,
+      "functional_cells": []
+    },
+    "routing": {
+      "method": "sequential",
+      "checkpoint": true,
+      "max_passes": 3,
+      "max_seconds": 120,
+      "max_net_seconds": 30,
+      "escape": {
+        "enabled": false,
+        "groups": [],
+        "max_seconds": 30,
+        "max_candidates": 5000,
+        "max_backtracks": 32,
+        "max_candidates_per_pin": 64
+      },
+      "local_repair": {
+        "enabled": true,
+        "max_attempts": 3,
+        "max_ripup_nets": 3,
+        "max_seconds": 15,
+        "radius": 120
+      }
+    },
+    "automation": {
+      "enabled": true,
+      "max_seconds": 600,
+      "max_layout_repairs": 2,
+      "repair_radius": 200,
+      "max_moved_components": 8,
+      "stagnation_rounds": 2
+    },
+    "max_iterations": 3
+  }
+}

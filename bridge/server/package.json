@@ -1,0 +1,17 @@
+{
+  "name": "pcb-easyeda-bridge-server",
+  "version": "1.1.36",
+  "private": true,
+  "type": "module",
+  "description": "Local EasyEDA bridge server bundled with the PCB workflow",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "server": "node bridge-server.mjs"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
+  }
+}

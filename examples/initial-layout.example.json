@@ -1,0 +1,11 @@
+{
+  "options": {
+    "placement": {
+      "method": "analytic_sa",
+      "initialization": "auto",
+      "max_candidates": 8000,
+      "max_seconds": 60,
+      "seed": 0
+    }
+  }
+}

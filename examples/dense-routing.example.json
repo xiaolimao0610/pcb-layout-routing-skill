@@ -1,0 +1,28 @@
+{
+  "options": {
+    "placement": {
+      "enabled": false
+    },
+    "routing": {
+      "method": "sequential",
+      "occupancy_grid": true,
+      "max_seconds": 120,
+      "max_net_seconds": 30,
+      "geometry_search": {
+        "enabled": true,
+        "sampling": "balanced"
+      },
+      "fanout": {
+        "enabled": false,
+        "packages": []
+      },
+      "shove": {
+        "enabled": false,
+        "movable_trace_ids": []
+      },
+      "diff_layer_change": {
+        "enabled": false
+      }
+    }
+  }
+}

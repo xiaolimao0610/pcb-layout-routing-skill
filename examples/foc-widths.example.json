@@ -1,0 +1,9 @@
+{
+  "constraints": [
+    {
+      "operator": "CHANNEL_SPEC",
+      "net": "+10V",
+      "min_width": 30
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+# 本地依赖与缓存
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.pytest_cache/
+.DS_Store
+Thumbs.db
+
+# 本地凭据、PCB工程和运行证据不发布
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
+*.zip
+*.eprj
+*.epro
+*.epro2
+project-state*.json
+calculation-checkpoint.json
+writeback-plan.json
+pcb-run/
+pcb-runs/
+run-output/

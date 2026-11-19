@@ -93,8 +93,8 @@ def construction_view(board):
     return candidate
 
 
-def _terminals(board, net):
-    values = terminal_items(board, net)
+def _terminals(board, net, *, layer=None):
+    values = terminal_items(board, net, layer=layer)
     if len(values) != 2:
         raise PipelineError(f"SIGNAL_QUALITY_UNSUPPORTED: {net} 仅支持两个真实端子的单路径，当前{len(values)}端")
     return values
@@ -118,7 +118,6 @@ def measured_path(board, net):
     多端、分支、铜区、过孔、重叠线及不能连接真实端子的路径明确拒绝。
     长度为实际走线中心线几何长度，不推断介质延迟或焊盘内部传播长度。
     """
-    terminals = _terminals(board, net)
     routes = board["routes"]
     if any(item["net"] == net for kind in ("vias", "shield_vias", "copper_pours") for item in routes.get(kind, [])):
         raise PipelineError(f"SIGNAL_QUALITY_UNSUPPORTED: {net} 含孔或铜区，未证明唯一同层长度路径")
@@ -128,6 +127,8 @@ def measured_path(board, net):
     layers = {trace["layer"] for _, trace in records}
     if len(layers) != 1:
         raise PipelineError(f"SIGNAL_QUALITY_UNSUPPORTED: {net} 跨层走线没有已证明的长度路径")
+    layer = next(iter(layers))
+    terminals = _terminals(board, net, layer=layer)
     lines = [LineString([(t["sx"], t["sy"]), (t["ex"], t["ey"])]) for _, t in records]
     copper_line = unary_union(lines)
     line = copper_line if copper_line.geom_type == "LineString" else linemerge(copper_line)
@@ -136,9 +137,10 @@ def measured_path(board, net):
             or abs(sum(piece.length for piece in lines)-line.length) > tolerance):
         raise PipelineError(f"SIGNAL_QUALITY_UNSUPPORTED: {net} 含分支、断点、环路或重叠线")
     ends = [Point(line.coords[0]), Point(line.coords[-1])]
-    matches = [set(i for i, terminal in enumerate(terminals) if terminal["inner"].distance(point) <= tolerance) for point in ends]
+    matches = [{i for i, terminal in enumerate(terminals)
+                if terminal["inner"].distance(point) <= tolerance} for point in ends]
     if len(matches[0]) != 1 or len(matches[1]) != 1 or matches[0] == matches[1]:
-        raise PipelineError(f"SIGNAL_QUALITY_INCOMPLETE: {net} 中心线路径未在两个真实端子内结束")
+        raise PipelineError(f"SIGNAL_QUALITY_INCOMPLETE: {net} 中心线路径未在本走线层的两个真实端子内结束")
     # 同网铜的短接不会被原异网DRC视为错误，但会让线长之和失去唯一路径含义。
     gap = rules_for(board).default_clearance
     max_width=max(t["width"] for _,t in records)
@@ -167,7 +169,7 @@ def measured_path(board, net):
             end=max(end,high)
         if (end_index==0 and start>tolerance) or (end_index==1 and end<line.length-tolerance):
             raise PipelineError(f"SIGNAL_QUALITY_INCOMPLETE: {net} 端子接触没有连续至路径端点")
-    return dict(line=line, layer=next(iter(layers)), length=float(line.length),
+    return dict(line=line, layer=layer, length=float(line.length),
                 widths=[float(t["width"]) for _, t in records], trace_indices=[i for i, _ in records])
 
 

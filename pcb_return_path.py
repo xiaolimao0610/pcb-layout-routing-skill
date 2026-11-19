@@ -7,8 +7,9 @@ import json
 from pathlib import Path
 import time
 
-from shapely.geometry import Point, GeometryCollection
+from shapely.geometry import Point, LineString, GeometryCollection
 from shapely.ops import unary_union
+from shapely.strtree import STRtree
 
 from pcb_pipeline_common import (PipelineError, normalize_board, rules_for, strict_options, finite,
                                  check_board, copper_and_drills, fingerprint, polygons, polygon_record, CollisionModel,
@@ -136,6 +137,22 @@ def _same_surface_connectivity(surface,trace):
     return any(p.covers(a) and p.covers(b) for p in polygons(surface))
 
 
+def _neck_component_split(core_index, trace):
+    """输入收缩后铜面分量的空间索引和走线，输出端点分属两岸的证据，同岸返回空字典。
+
+    投影靠近铜边时可能位于核心外，取各端点最近的核心。等距时沿用同一层内稳定的
+    顺序，使铜桥中点处相接的两段不会分别认领不同的岸。几何异常由调用层处理。
+    """
+    if core_index is None:
+        return {}
+    endpoints = (Point(trace["sx"], trace["sy"]), Point(trace["ex"], trace["ey"]))
+    nearest = [int(min(core_index.query_nearest(point))) for point in endpoints]
+    if nearest[0] == nearest[1]:
+        return {}
+    return {"neck_cores_disconnected": True, "endpoint_core_indices": nearest,
+            "endpoint_core_bounds_mil": [list(core_index.geometries[i].bounds) for i in nearest]}
+
+
 def check_return_paths(board, options, *, before=None):
     """复核铺铜后的双向几何回流风险，返回完整结构化报告，不修改工程。
 
@@ -177,13 +194,15 @@ def check_return_paths(board, options, *, before=None):
         for net in options["signal_nets"]:
             if not any(t["net"]==net for _,t in signal_traces):
                 report["unknown"].append({"code":"NO_SIGNAL_TRACES","net":net})
+        neck_surfaces = {}
         for index,trace in signal_traces:
             mappings = [r for r in options["reference_layers"] if r["signal_layer"]==trace["layer"]]
             if not mappings:
                 report["unknown"].append({"code":"NO_REFERENCE_MAPPING","trace_index":index,"signal_layer":trace["layer"]})
             for mapping in mappings:
                 budget.check(count=True)
-                plane = surfaces[(mapping["reference_layer"],mapping["reference_net"])]
+                key = (mapping["reference_layer"], mapping["reference_net"])
+                plane = surfaces[key]
                 inner = _projection(trace,tolerance=rules_for(current).curve_tolerance)
                 outer = _projection(trace,options["guard_band"],rules_for(current).curve_tolerance)
                 missing = inner.difference(plane)
@@ -193,14 +212,28 @@ def check_return_paths(board, options, *, before=None):
                 guard_missing = outer.difference(inner).difference(plane)
                 if guard_missing.area > tolerance*tolerance:
                     report["guard_band_missing"].append({**record,"code":"GUARD_BAND_MISSING","guard_band_mil":options["guard_band"],**_area_evidence(guard_missing)})
+                connected = _same_surface_connectivity(plane, trace)
                 if options["min_neck_width"]:
                     radius = options["min_neck_width"]/2
-                    opened = plane.buffer(-radius).buffer(radius)
+                    if key not in neck_surfaces:
+                        eroded = plane.buffer(-radius)
+                        cores = polygons(eroded)
+                        core_index = STRtree(cores) if len(cores) > 1 else None
+                        neck_surfaces[key] = (core_index, eroded.buffer(radius))
+                    core_index, opened = neck_surfaces[key]
                     thin = inner.intersection(plane).difference(opened)
-                    if thin.area > tolerance*tolerance:
-                        report["guard_band_missing"].append({**record,"code":"REFERENCE_NECK_BELOW_LIMIT",
-                            "min_neck_width_mil":options["min_neck_width"],**_area_evidence(thin)})
-                if not _same_surface_connectivity(plane,trace):
+                    # 膨胀可能覆盖短铜桥，只能证明局部投影；跨岸的宽度须由收缩后的连通性证明。
+                    split = _neck_component_split(core_index, trace) if connected else {}
+                    if thin.area > tolerance*tolerance or split:
+                        # 恰好达到下限时，腐蚀后的通路可能退化为线。逐点到原铜边的最小距离
+                        # 能独立证明整条中心线容得下所需半径，无须放宽几何容差。
+                        axis = LineString((record["start"], record["end"]))
+                        wide_corridor = any(p.covers(axis) and axis.distance(p.boundary) >= radius
+                                            for p in polygons(plane))
+                        if not wide_corridor:
+                            report["guard_band_missing"].append({**record,"code":"REFERENCE_NECK_BELOW_LIMIT",
+                                "min_neck_width_mil":options["min_neck_width"],**_area_evidence(thin),**split})
+                if not connected:
                     report["reference_disconnections"].append({**record,"code":"REFERENCE_COMPONENT_DISCONTINUITY"})
         report["forward_complete"] = True
         if prior is None:

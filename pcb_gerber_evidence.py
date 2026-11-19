@@ -148,8 +148,15 @@ def parse_gerber(text, *, budget=None, profile='round_caps'):
     region, contour, ended, multiquadrant = False, False, False, False
     draws, file_function = [], None
     for ordinal, (extended, command) in enumerate(_tokens(text, budget)):
-        if command.startswith('G04'):
-            continue
+        if not extended and command.startswith('G04'):
+            comment = command[3:].lstrip()
+            if not comment.startswith('#@!'):
+                continue
+            # Gerber 标准属性注释和扩展属性具有相同含义，也受重复及文件终止校验约束。
+            command = comment[3:].lstrip()
+            if not command.startswith(('TF', 'TA', 'TO', 'TD')):
+                raise EvidenceError('unsupported: 未知的 Gerber 属性注释')
+            extended = True
         if ended:
             raise EvidenceError('unsupported: M02 后存在命令')
         if extended:
@@ -191,9 +198,10 @@ def parse_gerber(text, *, budget=None, profile='round_caps'):
             if command in ('LPD', 'IPPOS'):
                 continue
             if command.startswith(('TF.', 'TA.', 'TO.')) or command == 'TD' or command.startswith('TD.'):
-                if command.startswith('TF.FilePolarity,') and command != 'TF.FilePolarity,Positive':
-                    raise EvidenceError('unsupported: 负片文件极性')
-                if command.startswith('TF.FileFunction,'):
+                attribute = command.partition(',')[0]
+                if attribute == 'TF.FilePolarity' and command != 'TF.FilePolarity,Positive':
+                    raise EvidenceError('unsupported: 未知或负片文件极性')
+                if attribute == 'TF.FileFunction':
                     if file_function is not None:
                         raise EvidenceError('文件层属性重复，不能确定层映射')
                     file_function = command.split(',')[1:]
@@ -420,8 +428,13 @@ def build_geometry_context(board, receipt, archive_path, layer_map, *, profile='
             parsed[layer] = parse_gerber(text, budget=budget, profile=profile)
             function = parsed[layer]['file_function']
             if function is not None:
-                order = board.get('rules', {}).get('copper_layers', [1, 2]).index(layer) + 1
-                if len(function) < 2 or function[0] != 'Copper' or function[1] != f'L{order}':
+                stack = board.get('rules', {}).get('copper_layers', [1, 2])
+                order = stack.index(layer) + 1
+                if len(stack) == 1:
+                    side = 'Bot' if layer == 2 else 'Top'
+                else:
+                    side = 'Top' if order == 1 else 'Bot' if order == len(stack) else 'Inr'
+                if function[:3] != ['Copper', f'L{order}', side]:
                     raise EvidenceError('错层: 显式层映射与 Gerber FileFunction 属性矛盾')
     final_layers = {}
     if profile == 'final_image':

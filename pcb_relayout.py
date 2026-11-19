@@ -213,6 +213,7 @@ def main(argv=None):
     prep = sub.add_parser("prepare")
     for name in ("inspection", "proposal", "cleanup", "output"):
         prep.add_argument("--" + name, required=True)
+    prep.add_argument("--full-output", action="store_true", help="在终端按原格式显示完整布局计划")
     apply = sub.add_parser("apply")
     apply.add_argument("--plan", required=True)
     apply.add_argument("--audit-dir", required=True)
@@ -224,6 +225,12 @@ def main(argv=None):
     if args.command == "prepare":
         result = prepare_plan(read(args.inspection), read(args.proposal), read(args.cleanup))
         write(args.output, result)
+        if not args.full_output:
+            print(json.dumps(dict(prepared=True, components=len(result["proposal"]["initial_poses"]),
+                                  job_key=result["job_key"], full_board_accepted=result["full_board_accepted"],
+                                  requires_reexport=result["requires_reexport"], plan=str(Path(args.output).resolve())),
+                             ensure_ascii=False))
+            return 0
     else:
         if not args.window_id:
             parser.error("--window-id is required for native operations")

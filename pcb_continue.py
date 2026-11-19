@@ -8,7 +8,9 @@ from argparse import ArgumentParser
 from copy import deepcopy
 import json
 from pathlib import Path
+import sys
 import time
+import traceback
 
 from shapely.ops import unary_union
 
@@ -76,6 +78,48 @@ def connectivity(board, nets):
     return result
 
 
+def _summary(report, output):
+    """输入已落盘的续算报告及其目录，返回有界的选网结果；不改变报告的验收范围。"""
+    connectivity = report["connectivity"]
+    failures = report["failed_nets"]
+    pending = set(report["not_attempted"])
+    negotiated = report["stats"]["method"] == "negotiated"
+    summary = {k: report[k] for k in ("preview_only", "full_board_accepted", "selected_connectivity_passed",
+                                      "writeback_plan_generated", "requires_live_rebase", "added")}
+    summary.update(selected=len(connectivity), connected=sum(v["passed"] for v in connectivity.values()),
+                   not_attempted=len(pending), deferred_ground=len(report["deferred_ground_nets"]),
+                   geometry_errors=len(report["final_geometry_errors"]), topology_errors=len(report["topology_errors"]),
+                   report=str((output / "result.json").resolve()), progress=str((output / "progress.jsonl").resolve()))
+    if negotiated and failures:
+        # 原始报告在每个批成员下保存同一异常。仅当诊断点名该网时才归因到具体网络。
+        summary["batch_error"] = next(iter(failures.values()))["error"][:240]
+    diagnosed, disconnected = [], []
+    issue_count = 0
+    for net, status in connectivity.items():
+        failure = failures.get(net)
+        detail = (failure or {}).get("diagnostics") or {}
+        attributable = failure and (not negotiated or detail.get("net") == net)
+        if status["passed"] and not attributable:
+            continue
+        issue_count += 1
+        sample = diagnosed if attributable else disconnected
+        if len(sample) >= 5:
+            continue
+        row = dict(net=net if len(net) <= 128 else net[:127] + "…",
+                   physical_groups=status["physical_groups"], not_attempted=net in pending)
+        if len(net) > 128:
+            row["net_truncated"] = True
+        if attributable:
+            row["error"] = failure["error"][:240]
+            if detail.get("code"):
+                row["code"] = detail["code"]
+        sample.append(row)
+    issues = (diagnosed + disconnected)[:5]
+    if issues:
+        summary.update(network_diagnostics=issues, additional_networks=issue_count - len(issues))
+    return summary
+
+
 def main(argv=None):
     """读取续算命令行并输出来源绑定的候选与统计，不操作原生编辑器。
 
@@ -90,6 +134,7 @@ def main(argv=None):
     parser.add_argument("--trace-patch", help="Explicit JSON source_segments and replacement_segments for local rerouting")
     parser.add_argument("--config", help="Optional solver-config containing options and constraints")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--full-output", action="store_true", help="在终端同时显示逐网完整进度（始终保存在 progress.jsonl）")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--nets", nargs="+")
     selection.add_argument("--exclude-net", action="append", default=[])
@@ -105,6 +150,21 @@ def main(argv=None):
         parser.error("search budgets and grid step must be positive")
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=False)
+    try:
+        return _run(args, parser, output)
+    except (ValueError, OSError, TypeError, KeyError) as exc:
+        # 已独占的新目录可留存原始异常，调用本函数的旧程序仍可捕获原有异常类型。
+        log = output / "error.log"
+        log.write_text(traceback.format_exc(), encoding="utf-8")
+        if args.full_output or argv is not None:
+            raise
+        print(json.dumps({"status": "failed", "full_board_accepted": False, "error": str(exc)[:240],
+                          "log": str(log.resolve())}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+def _run(args, parser, output):
+    """按既有选网流程求解，完整记录进度与报告；输入不可用或写盘失败时抛出原异常。"""
     original = read(args.board)
     original = original.get("board", original)
     baseline = read(args.source_board) if args.source_board else deepcopy(original)
@@ -235,7 +295,10 @@ def main(argv=None):
         def emit(event, **data):
             entry = dict(event=event, elapsed_seconds=round(time.monotonic() - started, 3), **data)
             line = json.dumps(entry, ensure_ascii=False)
-            log.write(line + "\n"); log.flush(); print(line, flush=True)
+            log.write(line + "\n")
+            log.flush()
+            if args.full_output:
+                print(line, flush=True)
 
         def target():
             result = deepcopy(original)
@@ -356,6 +419,8 @@ def main(argv=None):
             write(output / "writeback-plan.json", plan)
         write(output / "result.json", report)
         emit("finished", selected_connectivity_passed=passed, added=report["added"])
+        if not args.full_output:
+            print(json.dumps(_summary(report, output), ensure_ascii=False, separators=(",", ":")))
         return 0 if passed else 1
 
 

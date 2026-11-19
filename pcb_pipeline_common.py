@@ -364,14 +364,22 @@ def copper_and_drills(board, *, stats=None, net_filter=None, geometry_context=No
     return finished, drills
 
 
-def terminal_items(board, net):
+def terminal_items(board, net, *, layer=None):
+    """输入规范板、网名及可选铜层，返回各端子的实铜和代表点。
+
+    指定层时只使用该层扣除真实钻孔后的铜。无指定层沿用原有跨层并集。
+    端子没有相应实铜时抛出 PipelineError。
+    """
     copper, _ = copper_and_drills(board, net_filter=net)
     result = []
     for ref in board["nets"].get(net, []):
         key = (str(ref["compId"]), str(ref["padId"]))
-        items = [p for p in copper if p["terminal"] == key and p["net"] == net]
+        items = [p for p in copper if p["terminal"] == key and p["net"] == net
+                 and (layer is None or layer in p["layers"])]
         inner = unary_union([p["inner"] for p in items])
         if inner.is_empty:
+            if layer is not None:
+                raise PipelineError(f"端子 {key} 在铜层 {layer} 没有可证明的导电区域")
             raise PipelineError(f"terminal {key} has no provable copper")
         point = inner.representative_point()
         result.append(dict(key=key, point=(point.x, point.y),

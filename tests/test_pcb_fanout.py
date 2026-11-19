@@ -49,6 +49,23 @@ def run(board, cfg=None):
 
 
 class FanoutTests(unittest.TestCase):
+    def test_no_vias_keeps_reachable_surface_in_mixed_exit_layers(self):
+        cfg = options()
+        cfg["allow_vias"] = False
+        package = cfg["fanout"]["packages"][0]
+        package["escape_layers"] = [1]
+        reference, _ = run(fixture(), cfg)
+        package["escape_layers"] = [15, 1]
+        result, stats = run(fixture(), cfg)
+        self.assertEqual(reference["routes"], result["routes"])
+        self.assertEqual(len(stats["fanout"]["escaped"]), 4)
+        self.assertEqual(result["routes"].get("vias", []), [])
+        self.assertEqual({t["layer"] for t in result["routes"]["traces"]}, {1})
+        self.assertEqual(check_board(result), [])
+        package["escape_layers"] = [15]
+        with self.assertRaises(PipelineError):
+            run(fixture(), cfg)
+
     def test_finer_pitch_array_with_explicit_manufacturing_rules(self):
         board = fixture(3)
         pitch = 31.5

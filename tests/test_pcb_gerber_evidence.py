@@ -227,6 +227,34 @@ class GerberEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(EvidenceError, '错层'):
                 build_geometry_context(*args)
 
+    def test_comment_and_extended_file_attributes_have_identical_effect(self):
+        for profile in ('round_caps', 'final_image'):
+            for template in ('%{}*%', 'G04 #@! {}*'):
+                for attribute, error in (('TF.FileFunction,Copper,L2,Bot', '错层'),
+                                         ('TF.FileFunction,Copper,L1,Bot', '错层'),
+                                         ('TF.FileFunction', '错层'),
+                                         ('TF.FilePolarity', '极性'),
+                                         ('TF.FilePolarity,Negative', '极性'),
+                                         ('TF.FileFunction,Copper,L1,Top', None),
+                                         ('TF.FilePolarity,Positive', None)):
+                    with self.subTest(profile=profile, template=template, attribute=attribute), tempfile.TemporaryDirectory() as d:
+                        args = fixture(d, GERBER.replace('G75*', template.format(attribute)+'G75*'))
+                        if error:
+                            with self.assertRaisesRegex(EvidenceError, error):
+                                build_geometry_context(*args, profile=profile)
+                        else:
+                            _, report = build_geometry_context(*args, profile=profile)
+                            self.assertTrue(report['complete'])
+                            self.assertFalse(report['full_board_accepted'])
+
+    def test_comment_attributes_share_duplicate_and_end_of_file_checks(self):
+        function = 'TF.FileFunction,Copper,L1,Top'
+        with self.assertRaisesRegex(EvidenceError, '重复'):
+            parse_gerber(GERBER.replace('G75*', '%'+function+'*%G04 #@! '+function+'*G75*'))
+        with self.assertRaisesRegex(EvidenceError, 'M02'):
+            parse_gerber(GERBER+'G04 #@! TF.FilePolarity,Positive*')
+        self.assertIsNone(parse_gerber(GERBER.replace('G75*', 'G04 TF.FilePolarity,Negative*G75*'))['file_function'])
+
     def test_before_build_candidate_is_not_claimed_native_verified(self):
         with tempfile.TemporaryDirectory() as d:
             board, receipt, archive, layers = fixture(d)

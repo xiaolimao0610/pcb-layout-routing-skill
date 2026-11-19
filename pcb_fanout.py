@@ -129,6 +129,18 @@ def _array(board, package):
     return tasks
 
 
+def _reachable_exit_layers(requested, face, settings, stack):
+    """输入候选层、焊盘面、网络规则与层叠，返回可生成新铜的有序出口层；无可达层抛出 PipelineError。"""
+    layers = [layer for layer in requested if layer in settings["layers"]]
+    if not layers:
+        raise PipelineError("没有满足 CHANNEL_SPEC/trace_layers 的出口铜层")
+    if settings["vias"] and set(stack).issubset(settings["via_layers"]):
+        return layers
+    if face in layers:
+        return [face]
+    raise PipelineError("所有候选出口均需换层，但该网络不允许完整物理层栈通孔")
+
+
 def _choices(board, task, options, check):
     """联合选择侧边、落孔和出口层；实际新铜占据通道供后续球位避让。"""
     from pcb_routing import _net_options, _octilinear_doglegs, _candidate_cost
@@ -139,11 +151,7 @@ def _choices(board, task, options, check):
     face = pad.get("layer", component["layer"])
     if face not in settings["layers"] or face not in (1, 2):
         raise PipelineError("球位表面不在允许布线层，或不是受支持的单面贴片球")
-    layers = [layer for layer in package["escape_layers"] if layer in settings["layers"]]
-    if not layers:
-        raise PipelineError("球位没有满足 CHANNEL_SPEC/trace_layers 的出口铜层")
-    if any(layer != face for layer in layers) and (not settings["vias"] or not set(stack).issubset(settings["via_layers"])):
-        raise PipelineError("球位换层需要允许完整层栈的通孔，不能隐式改成盲埋孔")
+    layers = _reachable_exit_layers(package["escape_layers"], face, settings, stack)
     # 同一圈优先轮换出口层；实际阻挡始终由已预留铜与精确检查决定。
     offset = task["ring"] % len(layers)
     layers = layers[offset:] + layers[:offset]

@@ -692,6 +692,132 @@ def _clear_accepted(output):
             path.unlink()
 
 
+def _short_text(text, limit=240):
+    """限制终端单个字段的长度，保留省略标记；报告中的原文保持完整。"""
+    text = " ".join(str(text).splitlines())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _network_diagnostics(evidence, attempt, stage):
+    """从失败阶段取明确的网络、端点及逐网理由；单列尚未完成的网络，输出规模有界。"""
+    sources = [evidence, evidence.get("failure_context")]
+    pending = evidence.get("unfinished_nets", [])
+    # 协商最后一次失败可能来自旧轮次，只采用与最终未完成清单一致的证据。
+    last = evidence.get("last_failure")
+    if isinstance(last, dict) and last.get("net") in pending:
+        sources.append(last)
+    if evidence.get("code") == "NEGOTIATED_BUDGET":
+        batches = evidence.get("stats", {}).get("negotiated_batches", [])
+        if batches and batches[-1].get("rounds"):
+            sources.append(batches[-1]["rounds"][-1])
+    if stage == "return_path":
+        quality = attempt.get("return_path_report", {})
+        for key in ("trace_projection_missing", "guard_band_missing", "via_clearance_change",
+                    "old_signal_reference_changes", "reference_disconnections", "unknown"):
+            sources.extend(quality.get(key, []))
+    names, unfinished, examples = {}, {}, []
+    for row in sources:
+        if not isinstance(row, dict):
+            continue
+        net = row.get("net") or row.get("failed_net")
+        if isinstance(net, str) and net:
+            names[net] = None
+            example = {"net": _short_text(net, 100)}
+            for key in ("code", "message", "signal_layer", "reference_layer"):
+                if (key in row and row[key] != evidence.get(key)
+                        and row[key] != f"{evidence.get('code')}: {evidence.get('message')}"):
+                    example[key] = _short_text(row[key], 160)
+            for key in ("source_terminals", "target_terminals"):
+                if row.get(key):
+                    example[key] = [[_short_text(part, 60) for part in endpoint[:2]]
+                                    if isinstance(endpoint, (tuple, list)) else _short_text(endpoint, 100)
+                                    for endpoint in row[key][:2]]
+            if len(example) > 1 and len(examples) < 4 and example not in examples:
+                examples.append(example)
+        for key in ("failed_nets", "conflicting_nets", "exact_failed_nets", "unfinished_nets"):
+            listed = row.get(key)
+            if isinstance(listed, (list, tuple, dict)):
+                target = unfinished if key == "unfinished_nets" else names
+                target.update((name, None) for name in listed if isinstance(name, str) and name)
+    info = {}
+    for items, key, count_key in ((names, "nets", "net_count"), (unfinished, "unfinished_nets", "unfinished_count")):
+        if items:
+            info[count_key] = len(items)
+            info[key] = [_short_text(name, 100) for name in list(items)[:8]]
+            if len(items) > 8:
+                info[key + "_omitted"] = len(items) - 8
+    if examples:
+        info["network_details"] = examples
+    return info
+
+
+def failure_summary(result):
+    """输入 run_pipeline 的失败报告，返回本轮阶段、原因和有上限的已知网络诊断。
+
+    全局输入错误只保留原因，未经诊断点名的网络不推断为失效。缺少阶段、网络等
+    可选信息时省略相应字段。调用者仍须保存原报告以供逐项追查。
+    """
+    attempts = result.get("attempts", [])
+    attempt = attempts[-1] if attempts else {}
+    failed_stage = next((s for s in reversed(attempt.get("stages", [])) if s.get("passed") is False), {})
+    stop = attempt.get("feedback_error")
+    if failed_stage.get("stage") == "feedback" and len(attempts) >= 2:
+        previous = attempts[-2]
+        routing = next((s for s in reversed(previous.get("stages", []))
+                        if s.get("stage") == "routing" and s.get("passed") is False), None)
+        if routing:
+            stop = failed_stage.get("error")
+            attempt, failed_stage = previous, routing
+    violations = result.get("violations", [])
+    evidence = failed_stage.get("diagnostics", attempt.get("diagnostics", {}))
+    reason = failed_stage.get("error") or (violations[-1] if violations else "失败原因未记录")
+    diagnostic = {"message": _short_text(evidence.get("message") or reason)}
+    if "stage" in failed_stage:
+        diagnostic["stage"] = failed_stage["stage"]
+    for key in ("code", "phase", "budget_scope"):
+        if evidence.get(key):
+            diagnostic[key] = _short_text(evidence[key], 80)
+
+    diagnostic.update(_network_diagnostics(evidence, attempt, failed_stage.get("stage")))
+    details = evidence.get("errors", [])
+    if details:
+        diagnostic["details"] = [_short_text(error) for error in details[:2]]
+        diagnostic["detail_count"] = len(details)
+    if stop:
+        diagnostic["stop_reason"] = _short_text(stop)
+    return diagnostic
+
+
+def _solve_summary(result, report_path, task=None):
+    """入参为原求解报告、已成功落盘的报告路径和原任务。返回可序列化的终端摘要。
+
+    仅在离线或信号阶段已验收时统计已核对的网络数。异常发生在创建输出前时，
+    report_path 为 None，摘要不引用旧报告。调用者保留原命令的退出码和输出流。
+    """
+    summary = {"status": result["status"], "passed": result["passed"],
+               "full_board_accepted": result.get("full_board_accepted", False),
+               "report": str(report_path.resolve()) if report_path is not None else None}
+    signal_ok = result.get("signal_stage_passed", False)
+    if "signal_stage_passed" in result:
+        summary["signal_stage_passed"] = signal_ok
+    board = task.get("board") if isinstance(task, dict) else None
+    nets = board.get("nets") if isinstance(board, dict) else None
+    if isinstance(nets, dict):
+        counts = summary["nets"] = {"total": len(nets)}
+        if result["passed"] or signal_ok:
+            deferred = len(result.get("deferred_ground_nets", []))
+            counts.update(verified_offline=len(nets) - deferred, deferred_ground=deferred)
+    if result["passed"] or signal_ok:
+        summary["artifacts"] = ["board.json", "writeback-plan.json", "board.svg"]
+        if result.get("pending_stages"):
+            summary["pending_stages"] = result["pending_stages"]
+    else:
+        summary["diagnostic"] = failure_summary(result)
+        if "cleanup_error" in result:
+            summary["cleanup_error"] = _short_text(result["cleanup_error"])
+    return summary
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -699,11 +825,14 @@ def main(argv=None):
     solve.add_argument("--input", type=Path, required=True)
     solve.add_argument("--output-dir", type=Path, required=True)
     solve.add_argument("--overwrite", action="store_true")
+    solve.add_argument("--full-output", action="store_true",
+                       help="在终端输出完整 result.json 内容。默认输出单行摘要，完整报告始终保存在输出目录")
     solve.add_argument("--resume-checkpoint", type=Path, help="上一轮独立计算检查点；不作为验收板")
     solve.add_argument("--checkpoint-sha256", help="上次工件记录的SHA256，恢复时必填")
     validate = sub.add_parser("validate", help="strictly check a canonical board including compiled constraints")
     validate.add_argument("--input", type=Path, required=True)
     validate.add_argument("--output", type=Path)
+    validate.add_argument("--full-output", action="store_true", help="指定 --output 时仍在终端显示完整违规清单")
     prepare = sub.add_parser("prepare", help="combine a bridge snapshot and explicit solver configuration")
     prepare.add_argument("--board", type=Path, required=True)
     prepare.add_argument("--config", type=Path)
@@ -762,6 +891,7 @@ def main(argv=None):
             print(json.dumps({"passed": False, "violations": [str(exc)]}, ensure_ascii=False), file=sys.stderr)
             return 1
     prepared_output = None
+    data = None
     validation_output_safe = False
     def same_input(path):
         return (path.resolve() == args.input.resolve()
@@ -793,6 +923,13 @@ def main(argv=None):
             result = {"passed": not errors, "violations": errors, "units": "mil"}
             if args.output:
                 _json(args.output, result)
+                if not args.full_output:
+                    summary = {"passed": result["passed"], "units": "mil", "violation_count": len(errors),
+                               "report": str(args.output.resolve())}
+                    if errors:
+                        summary["violations"] = [_short_text(error) for error in errors[:4]]
+                    print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+                    return 0 if result["passed"] else 1
         else:
             from pcb_automation import read_checkpoint, write_checkpoint
             from pcb_project_state import file_sha256
@@ -820,14 +957,20 @@ def main(argv=None):
                 (output / "board.svg").write_text(_svg(result["board"]), encoding="utf-8")
             result = {k: v for k, v in result.items() if k not in ("board", "writeback_plan")}
             _json(output / "result.json", result)  # Accepted status commits last.
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.command == "solve" and not args.full_output:
+            print(json.dumps(_solve_summary(result, output / "result.json", data),
+                             ensure_ascii=False, separators=(",", ":")))
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["passed"] or result.get("signal_stage_passed") else 1
     except (OSError, GEOSException, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
         failed = {"passed": False, "status": "failed", "violations": [str(exc)]}
+        saved_report = None
         if prepared_output is not None:
             try:
                 _clear_accepted(prepared_output)
                 _json(prepared_output / "result.json", failed)
+                saved_report = prepared_output / "result.json"
             except OSError as cleanup_error:
                 failed["cleanup_error"] = str(cleanup_error)
         elif validation_output_safe:
@@ -835,7 +978,11 @@ def main(argv=None):
                 _json(args.output, failed)
             except OSError as output_error:
                 failed["report_error"] = str(output_error)
-        print(json.dumps(failed, ensure_ascii=False), file=sys.stderr)
+        if args.command == "solve" and not args.full_output:
+            print(json.dumps(_solve_summary(failed, saved_report, data), ensure_ascii=False,
+                             separators=(",", ":")), file=sys.stderr)
+        else:
+            print(json.dumps(failed, ensure_ascii=False), file=sys.stderr)
         return 1
 
 

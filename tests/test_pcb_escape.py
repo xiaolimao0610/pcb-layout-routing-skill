@@ -38,6 +38,23 @@ def run(board,cfg=None):
 
 
 class EscapeTests(unittest.TestCase):
+    def test_no_vias_preserves_surface_escape_with_optional_inner_layer(self):
+        cfg = options()
+        cfg["allow_vias"] = False
+        reference, _ = run(fixture(), cfg)
+        for group in cfg["escape"]["groups"]:
+            group["escape_layers"] = [1, 15]
+        result, stats = run(fixture(), cfg)
+        self.assertEqual(result["routes"], reference["routes"])
+        self.assertEqual(len(stats["escape"]["escaped"]), 4)
+        self.assertEqual(result["routes"].get("vias", []), [])
+        self.assertEqual({t["layer"] for t in result["routes"]["traces"]}, {1})
+        self.assertEqual(check_board(result), [])
+        for group in cfg["escape"]["groups"]:
+            group["escape_layers"] = [15]
+        with self.assertRaises(PipelineError):
+            run(fixture(), cfg)
+
     def test_reuse_requires_actual_geometry_and_partial_rerun_has_no_duplicates(self):
         original=fixture(); cfg=options()
         first,_=run(original,cfg)

@@ -1,7 +1,9 @@
 """分区初始化到工作流验收的端到端检查，不放宽来源或标签比较。"""
 from copy import deepcopy
 from pathlib import Path
+import json
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -9,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pcb_pipeline_common import normalize_board, fingerprint, PipelineError
 from pcb_global_place import PlacementFailure
 from pcb_pipeline import run_pipeline
-from pcb_workflow import observe_result
-from pcb_project_state import verify_candidate
+from pcb_workflow import observe_result, run_workflow
+from pcb_project_state import file_sha256, init_state, load_state, record_run, save_state, verify_candidate
 from pcb_compact import compact_layout
 
 
@@ -35,6 +37,56 @@ def task_fixture():
 
 
 class InitialWorkflowTests(unittest.TestCase):
+    def test_old_duplicate_round_does_not_exhaust_untried_seed(self):
+        task = task_fixture()
+        task["options"]["placement"]["seed"] = 42
+        policy = dict(max_rounds=1, stagnation_rounds=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, state = root/"board.json", root/"state.json"
+            base.write_text(json.dumps(task["board"]), encoding="utf-8")
+            save_state(state, init_state(base))
+            run_workflow(task, policy, root/"first", state)
+            # 登记旧版重复执行首轮时实际产生的合同格式与同一候选。
+            run_workflow(task, policy, root/"duplicate")
+            run = root/"duplicate/round-001"
+            result_file = run/"result.json"
+            result = json.loads(result_file.read_text(encoding="utf-8"))
+            result["candidate_rounds"][0].update(improved=False, consecutive_no_improvement=1,
+                                                  actual_stop_reason="STAGNATION_METHOD_STOP")
+            result_file.write_text(json.dumps(result), encoding="utf-8")
+            prior = load_state(state)
+            save_state(state, record_run(prior, run, "old-repeat"), expected_hash=file_sha256(state))
+            report = run_workflow(task, policy, root/"resumed", state)
+            trial = json.loads((root/"resumed/round-001/input-task.json").read_text(encoding="utf-8"))
+            self.assertEqual((report["rounds"][0]["round"], trial["options"]["placement"]["seed"]), (1, 43))
+            self.assertEqual(report["stop_reason"], "METHOD_SEQUENCE_EXHAUSTED")
+            with self.assertRaisesRegex(PipelineError, "停滞"):
+                run_workflow(task, policy, root/"genuine-stop", state)
+
+    def test_resume_continues_seed_sequence_and_stagnation_like_uninterrupted_run(self):
+        task = task_fixture()
+        task["options"]["placement"]["seed"] = 42
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, state = root / "board.json", root / "state.json"
+            base.write_text(json.dumps(task["board"]), encoding="utf-8")
+            save_state(state, init_state(base))
+            policy = dict(max_rounds=1, stagnation_rounds=1)
+            first = run_workflow(task, policy, root / "first", state)
+            second = run_workflow(task, policy, root / "second", state)
+            whole = run_workflow(task, dict(policy, max_rounds=2), root / "whole")
+            def seeds(*paths):
+                return [json.loads((p / "input-task.json").read_text(encoding="utf-8"))
+                        ["options"]["placement"]["seed"] for p in paths]
+            self.assertEqual(seeds(root/"first/round-001", root/"second/round-001"), [42, 43])
+            self.assertEqual(seeds(root/"whole/round-001", root/"whole/round-002"), [42, 43])
+            fields = ("round", "improved", "consecutive_no_improvement", "actual_stop_reason")
+            split = first["rounds"] + second["rounds"]
+            self.assertEqual([[r[k] for k in fields] for r in split],
+                             [[r[k] for k in fields] for r in whole["rounds"]])
+            self.assertEqual(second["stop_reason"], whole["stop_reason"])
+
     def test_empty_tags_have_one_canonical_form_and_source_is_unchanged(self):
         board = task_fixture()['board']
         source = deepcopy(board)

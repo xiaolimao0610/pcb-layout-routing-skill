@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 import time
 
-from pcb_pipeline import _task, run_pipeline
+from pcb_pipeline import _task, failure_summary, run_pipeline
 from pcb_pipeline_common import (PipelineError, board_polygon, check_board, finite,
                                  fingerprint, normalize_board, rules_for, strict_options)
 from pcb_routing import algorithm_options, check_routed_nets
@@ -190,6 +190,44 @@ def _write(path, value):
     Path(path).write_text(json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2)+"\n", encoding="utf-8")
 
 
+def _search_history(runs, task, settings):
+    """读取已验证状态中的同配置轮次，返回下轮序号、已试种子、各方法停滞数与已耗尽方法。
+
+    入参 runs 来自 load_state。沿用每轮实际 input-task 的种子，兼容旧版跨会话重置
+    轮号的记录。重复种子不重复累计无改善。索引文件不可读或历史合同无效时抛错。
+    """
+    context = _comparison_context(task)
+    next_round, tried, stagnant, exhausted = 0, set(), {}, set()
+    for run in runs:
+        prior_task = json.loads(Path(run["input_task"]["path"]).read_text(encoding="utf-8-sig"))
+        if _comparison_context(prior_task) != context:
+            continue
+        prior_result = json.loads(Path(run["result"]["path"]).read_text(encoding="utf-8-sig"))
+        for contract in prior_result.get("candidate_rounds", []):
+            stops = contract.get("stop_conditions", {})
+            if (stops.get("objective") != settings["objective"] or
+                    stops.get("min_relative_improvement") != settings["min_relative_improvement"]):
+                continue
+            index, improved = contract["round"], contract["improved"]
+            seed = prior_task["options"]["placement"]["seed"]
+            threshold = stops.get("stagnation_rounds")
+            reported = contract.get("consecutive_no_improvement")
+            if (type(index) is not int or index < 0 or type(seed) is not int or
+                    type(improved) is not bool or type(threshold) is not int or threshold < 1 or
+                    type(reported) is not int or reported < 0 or improved != (reported == 0)):
+                raise PipelineError("历史候选轮号、种子或停滞合同无效，停止接续")
+            next_round = max(next_round, index + 1)
+            key = fingerprint(contract["method"])
+            if improved:
+                stagnant[key] = 0
+            elif (key, seed) not in tried:
+                stagnant[key] = stagnant.get(key, 0) + 1
+                if contract.get("actual_stop_reason") == "STAGNATION_METHOD_STOP" and stagnant[key] >= threshold:
+                    exhausted.add(key)
+            tried.add((key, seed))
+    return next_round, tried, stagnant, exhausted
+
+
 def run_workflow(task, policy, output_dir, project_state_path=None):
     """有界执行显式方法序列并保存每轮合同；返回workflow-result摘要，不写EDA。
 
@@ -207,7 +245,7 @@ def run_workflow(task, policy, output_dir, project_state_path=None):
     state = state_hash = None
     previous_best = None
     resumed_method_index, resumed_stagnant = 0, 0
-    exhausted = set()
+    next_round, tried, exhausted = 0, set(), set()
     if project_state_path is not None:
         from pcb_project_state import load_state, file_sha256
         state_hash = file_sha256(project_state_path)
@@ -220,27 +258,12 @@ def run_workflow(task, policy, output_dir, project_state_path=None):
             raise PipelineError("工作流输入不等于project-state完整基线，先重新取证")
         if state.get("running_tasks"):
             raise PipelineError("project-state存在任务记录；先核对在途状态，不自动重复派发")
-        # 从真实历史合同接续停滞计数，不允许换目录或换会话重启耗尽的方法。
-        history = []
-        for old in state["runs"]:
-            prior_task = json.loads(Path(old["input_task"]["path"]).read_text(encoding="utf-8-sig"))
-            prior_result = json.loads(Path(old["result"]["path"]).read_text(encoding="utf-8-sig"))
-            if _comparison_context(prior_task) != _comparison_context(task):
-                continue
-            for contract in prior_result.get("candidate_rounds", []):
-                stops = contract.get("stop_conditions", {})
-                if (stops.get("objective") == settings["objective"]
-                        and stops.get("min_relative_improvement") == settings["min_relative_improvement"]):
-                    history.append(contract)
-        exhausted = {fingerprint(c["method"]) for c in history if c.get("actual_stop_reason") == "STAGNATION_METHOD_STOP"}
+        next_round, tried, historical_stagnation, exhausted = _search_history(state["runs"], task, settings)
         while resumed_method_index < len(settings["methods"]) and fingerprint(settings["methods"][resumed_method_index]) in exhausted:
             resumed_method_index += 1
         if resumed_method_index == len(settings["methods"]):
             raise PipelineError("历史候选合同显示这些方法已停滞；必须更换明确方法，不能换目录重启相同搜索")
-        if history and history[-1].get("method") == settings["methods"][resumed_method_index]:
-            resumed_stagnant = history[-1].get("consecutive_no_improvement", 0)
-            if type(resumed_stagnant) is not int or resumed_stagnant < 0:
-                raise PipelineError("历史合同停滞计数无效，停止接续")
+        resumed_stagnant = historical_stagnation.get(fingerprint(settings["methods"][resumed_method_index]), 0)
         if state["best_candidate"] is not None:
             old = next(run for run in state["runs"] if run["key"] == state["best_candidate"]["run_key"])
             old_task = json.loads(Path(old["input_task"]["path"]).read_text(encoding="utf-8-sig"))
@@ -261,22 +284,29 @@ def run_workflow(task, policy, output_dir, project_state_path=None):
     summary["resumed_no_improvement"] = stagnant
     key_prefix = "workflow:"+fingerprint({"output_dir":str(folder)})[:20]
     previous_started_method = None
-    for index in range(settings["max_rounds"]):
+    base_seed = task.get("options", {}).get("placement", {}).get("seed", 0)
+    for local_index in range(settings["max_rounds"]):
         if time.monotonic()-started >= settings["max_seconds"]:
             summary["stop_reason"] = "TIME_BUDGET"
             break
         method = settings["methods"][method_index]
+        method_key = fingerprint(method)
+        # 只跳过本方法的已试种子；对旧合同和显式更换基础种子的任务也适用。
+        while (method_key, base_seed + next_round) in tried:
+            next_round += 1
+        index = next_round
+        next_round += 1
         if previous_started_method is not None and method != previous_started_method:
             summary["method_changes"].append(dict(start_round=index, previous=deepcopy(previous_started_method),
                                                  next=deepcopy(method), reason="连续N轮无改善", executed=True))
         previous_started_method = deepcopy(method)
         trial = _method_task(task, method, index)
         contract = candidate_contract(board, trial, settings, index, method)
-        run_dir = folder/f"round-{index+1:03d}"
+        run_dir = folder/f"round-{local_index+1:03d}"
         run_dir.mkdir(exist_ok=False)
         _write(run_dir/"input-task.json", trial)
         _write(run_dir/"candidate-contract.json", contract)
-        run_key = f"{key_prefix}:round-{index+1:03d}"
+        run_key = f"{key_prefix}:round-{local_index+1:03d}"
         if state is not None:
             from pcb_project_state import set_task, save_state
             state = set_task(state, run_key, "offline_workflow", "running", run_dir)
@@ -355,7 +385,16 @@ def main(argv=None):
     try:
         read = lambda path: json.loads(path.read_text(encoding="utf-8-sig"))
         result = run_workflow(read(args.input), read(args.policy) if args.policy else {}, args.output_dir, args.project_state)
-        print(json.dumps({k:result[k] for k in ("status", "passed", "stop_reason", "best_candidate", "elapsed_seconds")}, ensure_ascii=False))
+        summary = {k: result[k] for k in ("status", "passed", "full_board_accepted", "stop_reason",
+                                          "best_candidate", "elapsed_seconds")}
+        folder = args.output_dir.resolve()
+        summary["report"] = str(folder/"workflow-result.json")
+        if not result["passed"] and result["rounds"]:
+            # 轮次目录按本次调用编号，合同中的全局轮号可跨越多个目录。
+            last = folder/f"round-{len(result['rounds']):03d}"/"result.json"
+            summary["failure"] = failure_summary(read(last))
+            summary["round_report"] = str(last)
+        print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
         return 0 if result["passed"] else 1
     except (PipelineError, OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
         print(json.dumps(dict(passed=False, status="failed", error=str(exc)), ensure_ascii=False))

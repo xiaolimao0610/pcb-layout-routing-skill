@@ -150,6 +150,8 @@ python -B pcb_render.py --board "$pcbRunDir/after-repour.json" --before "$pcbRun
 
 ## 6. 装配净距与丝印质量筛查
 
+从实际封装与装配图取得连接器的插合方向、线束和锁扣活动范围，以及高件周围焊接、夹持和返修所需的包络。用这些数据设置位置和净距，避免小件沿大电容紧贴一圈。调整后重新检查完整几何、布线和原生图像。
+
 `pcb_assembly.check_assembly(board, options)` 返回独立质量报告，不修改板、配置、器件、铜、文字或验收规则。CLI 如下；退出0仅为声明范围筛查通过，2为发现/未知/未完成，1为非法输入。报告不能覆盖输入板或配置。未知字段拒绝；不将这些字段加入 solver options。
 
 ```powershell

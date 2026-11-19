@@ -570,6 +570,7 @@ def main(argv=None):
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--placement-config", help="JSON placement options only")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--full-output", action="store_true", help="在终端按原格式显示所选候选的完整指标")
     args = parser.parse_args(argv)
     auto_fields = {"target_occupancy": args.target_occupancy, "aspect_ratio_range": args.aspect_ratio_range,
                    "aspect_ratio_steps": args.aspect_ratio_steps, "area_iterations": args.area_iterations,
@@ -593,7 +594,19 @@ def main(argv=None):
                             "reference_positions_used": report["reference_positions_used"],
                             "requires_native_outline_update_and_reexport": True})):
         (output / name).write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
-    print(json.dumps({"geometry_passed": report["geometry_passed"], "selected": report["selected"], "output_dir": str(output)}, ensure_ascii=False))
+    selected = report["selected"]
+    summary = {"geometry_passed": report["geometry_passed"], "selected": selected, "output_dir": str(output)}
+    if not args.full_output:
+        metrics = ("width_mil", "height_mil", "board_area_mil2", "occupied_fraction", "weighted_hpwl_mil",
+                   "rudy_peak", "rudy_overflow", "congestion_passed")
+        summary["selected"] = {k: selected[k] for k in metrics if k in selected}
+        summary.update(preview_only=report["preview_only"], full_board_accepted=report["full_board_accepted"],
+                       report=str((output/"result.json").resolve()))
+        if not report["geometry_passed"]:
+            violations = selected.get("violations", [])
+            summary["violation_count"] = len(violations)
+            summary["first_violations"] = [str(item)[:240] for item in violations[:3]]
+    print(json.dumps(summary, ensure_ascii=False))
     return 0 if report["geometry_passed"] else 1
 
 

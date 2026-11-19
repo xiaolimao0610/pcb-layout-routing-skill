@@ -7,7 +7,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pcb_pipeline_common import PipelineError, normalize_board, check_board
 from pcb_routing import _Budget, _net_options, RoutingFailure
-from pcb_differential import quality_report, route_pairs, validate_layer_change_options
+from pcb_differential import measured_path, quality_report, route_pairs, validate_layer_change_options
 from pcb_diff_multilayer import route_pair, pair_metrics, measured_multilayer_path
 
 
@@ -46,6 +46,35 @@ def generate(board, **diff):
 
 
 class PairedThroughViaTests(unittest.TestCase):
+    def test_planar_pair_requires_copper_on_the_actual_terminal_layer(self):
+        board = fixture(1)
+        board['routes']['traces'] = [dict(net=net, layer=15, width=10, sx=0, sy=y, ex=1000, ey=y)
+                                    for net, y in (('P', 10), ('N', -10))]
+        self.assertTrue(any('DISCONNECTED' in error for error in check_board(board)))
+        channels = CONSTRAINTS + [dict(operator="CHANNEL_SPEC", net=net,
+                                       length_group=dict(name="pair", tolerance=1)) for net in ("P", "N")]
+        wrong = quality_report(board, channels)
+        self.assertFalse(wrong['passed'])
+        self.assertFalse(wrong['differential_pairs'][0]['measured'])
+        self.assertFalse(wrong['length_groups'][0]['measured'])
+
+        for trace in board['routes']['traces']:
+            trace['layer'] = 1
+        self.assertEqual(check_board(board), [])
+        self.assertTrue(quality_report(board, channels)['passed'])
+
+    def test_layer_specific_drill_void_cannot_borrow_pad_copper_from_other_layers(self):
+        board = fixture(1)
+        for part in board['components']:
+            part['pads'][0].update(layer=12, hole=2, plated=True)
+        board['routes']['traces'] = [dict(net='P', layer=15, width=10, sx=3, sy=10, ex=997, ey=10)]
+        # 原有镀孔周围的焊盘实铜在所有层可用，另一处局部钻孔只切去两个内层。
+        board['routes']['holes'] = [dict(x=3, y=10, diameter=2, layers=[15, 16])]
+        with self.assertRaisesRegex(PipelineError, 'SIGNAL_QUALITY_INCOMPLETE'):
+            measured_path(board, 'P')
+        board['routes']['traces'][0]['layer'] = 1
+        self.assertEqual(measured_path(board, 'P')['length'], 994)
+
     def test_one_transition_actual_copper_and_independent_metrics(self):
         board = fixture()
         original = deepcopy(board)

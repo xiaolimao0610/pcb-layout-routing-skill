@@ -6,7 +6,7 @@ import time
 
 from shapely.geometry import Point
 
-from pcb_fanout import _commit_escape, _world
+from pcb_fanout import _commit_escape, _reachable_exit_layers, _world
 from pcb_pipeline_common import (CollisionModel, PipelineError, check_board, finite,
                                  normalize_board, rules_for, strict_options, _fast_pad_bounds)
 from pcb_solver_hardened import _body
@@ -149,11 +149,7 @@ def _choices(board, task, options, check, limit):
     settings, stack = _net_options(board, net, options), list(rules_for(board).copper_layers)
     if face not in (1, 2) or face not in settings["layers"]:
         raise PipelineError("escape 焊盘表面不在该网络允许布线层中")
-    layers = [layer for layer in group["escape_layers"] if layer in settings["layers"]]
-    if not layers:
-        raise PipelineError("escape 未声明满足 CHANNEL_SPEC/trace_layers 的出口层")
-    if any(layer != face for layer in layers) and (not settings["vias"] or not set(stack).issubset(settings["via_layers"])):
-        raise PipelineError("escape 换层需要允许完整物理层栈通孔")
+    layers = _reachable_exit_layers(group["escape_layers"], face, settings, stack)
     x, y = pad["localX"], pad["localY"]
     start, model, result, seen = _world(component, (x, y)), CollisionModel(board), [], set()
     for side in group["sides"]:

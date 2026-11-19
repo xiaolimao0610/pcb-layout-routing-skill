@@ -1,7 +1,7 @@
 /** 来源编码兼容回归；合成来源、模拟 getter，不连接或改写真实 EDA。 */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {exportBoard, nativeSerializedCoordinateMatches, nativeViaDimensionMatches, validateViaAnchors} from '../eda_adapter.mjs';
+import {applyPlan, exportBoard, nativeSerializedCoordinateMatches, nativeViaDimensionMatches, sourceFingerprint, validateViaAnchors} from '../eda_adapter.mjs';
 
 const record=(type,id,payload)=>JSON.stringify({type,id})+'||'+JSON.stringify(payload)+'|';
 const clone=structuredClone;
@@ -36,6 +36,186 @@ function fixture({attached=false,layer=1,rotation=0}={}){
   })};
   return {eda,context,objects,records};
 }
+
+// 使用正式写回入口及双向几何读回，在原生回调中插入独立编辑。
+async function transactionFixture(m=fixture()){
+  const {eda,context,records,objects}=m;
+  const baseline=await exportBoard(eda,context);
+  const original=await eda.sys_FileManager.getDocumentSource();
+  const trace={net:'SIG',layer:1,sx:100,sy:150,ex:130,ey:150,width:10};
+  const target=clone(baseline);
+  target.routes.traces.push(trace);
+  const plan={schema_version:1,plan_id:'write-once',source:baseline.metadata.source,components:[],
+    add:{traces:[trace],vias:[],copper_pours:[]},remove:{traces:[],vias:[],copper_pours:[]},target_board:target};
+  const state={restores:0,saves:0};
+  eda.sys_Storage={getExtensionUserConfig:async()=>state.journal,
+    setExtensionUserConfig:async(key,value)=>{state.journal=clone(value);return true;}};
+  eda.pcb_PrimitiveLine.create=async(net,layer,sx,sy,ex,ey,width)=>{
+    const line={id:'signal',Net:net,Layer:layer,StartX:sx,StartY:sy,EndX:ex,EndY:ey,LineWidth:width};
+    objects.Line.push(line);
+    records.push(['LINE','signal',{layerId:layer,netName:net,startX:sx,startY:sy,endX:ex,endY:ey,lineWidth:width}]);
+    return wrap('Line','signal',line);
+  };
+  eda.sys_FileManager.setDocumentSource=async value=>{
+    assert.equal(value,original);
+    state.restores++;
+    records.splice(5);
+    objects.Line.splice(4);
+    return true;
+  };
+  eda.pcb_Drc={check:async()=>[]};
+  eda.pcb_Document={save:async()=>{state.saves++;return true;}};
+  return {...m,state,original,plan,apply:()=>applyPlan(eda,plan,{context,save:true})};
+}
+
+test('DRC 期间的新丝印保留在现场，原计划不再派发',async()=>{
+  for(const issues of [[],[{rule:'spacing'}]]){
+    const m=await transactionFixture();
+    m.eda.pcb_Drc.check=async()=>{
+      m.records.push(['STRING','designer-note',{text:'手工丝印',layerId:3}]);
+      return issues;
+    };
+    const result=await m.apply();
+    assert.equal(result.success,false);
+    assert.equal(result.error.code,'BOARD_CHANGED');
+    assert.equal(m.state.restores,0);
+    assert.equal(m.state.saves,0);
+    assert.equal(result.recovery_required,true);
+    assert.equal(m.state.journal.status,'recovery_required');
+    assert.equal(m.state.journal.backup_source,m.original);
+    assert.deepEqual(m.state.journal.used_plan_ids,[m.plan.plan_id]);
+    const current=await m.eda.sys_FileManager.getDocumentSource();
+    assert.match(current,/designer-note/);
+    const newPlan={...m.plan,plan_id:'second',source:{...m.plan.source,fingerprint:sourceFingerprint(current)}};
+    const blocked=await applyPlan(m.eda,newPlan,{context:m.context});
+    assert.equal(blocked.error.code,'RECOVERY_REQUIRED');
+    assert.deepEqual(m.state.journal.used_plan_ids,[m.plan.plan_id]);
+  }
+});
+
+test('写入阶段混入未授权的丝印，后续 DRC 失败也不能倒回整个工程',async()=>{
+  const m=await transactionFixture(), create=m.eda.pcb_PrimitiveLine.create;
+  const layers=m.eda.pcb_Layer.getAllLayers;
+  m.eda.pcb_Layer.getAllLayers=async()=>[...await layers(),{id:3,type:'OTHER',layerStatus:1}];
+  m.eda.pcb_PrimitiveLine.create=async(...args)=>{
+    const line=await create(...args);
+    m.records.push(['STRING','concurrent',{layerId:3,text:'并发编辑'}]);
+    m.objects.String.push({id:'concurrent',Layer:3});
+    return line;
+  };
+  m.eda.pcb_Drc.check=async()=>[{rule:'spacing'}];
+  const result=await m.apply();
+  assert.equal(result.error.code,'NATIVE_DRC_FAILED');
+  assert.equal(result.recovery_required,true);
+  assert.equal(m.state.restores,0);
+  assert.match(await m.eda.sys_FileManager.getDocumentSource(),/concurrent/);
+});
+
+test('原生返回的图元 ID 消失且额外出现未知偏移铜时保留现场',async()=>{
+  const m=await transactionFixture(), create=m.eda.pcb_PrimitiveLine.create;
+  m.eda.pcb_PrimitiveLine.create=async(...args)=>{
+    const line=await create(...args);
+    m.objects.Line.at(-1).id='replacement';
+    m.objects.Line.at(-1).EndY+=5;
+    m.records.at(-1)[1]='replacement';
+    m.records.at(-1)[2].endY+=5;
+    return line;
+  };
+  const result=await m.apply();
+  assert.equal(result.error.code,'READBACK_FAILED');
+  assert.equal(result.recovery_required,true);
+  assert.equal(m.state.restores,0);
+  assert.equal(m.state.journal.status,'recovery_required');
+});
+
+test('允许父件带动附属孔，而附属孔的额外改网须进入恢复状态',async()=>{
+  const base=fixture({attached:true});
+  base.context.pad_dimensions='api';
+  base.context.components.U.footprint_source=[
+    record('DOCHEAD',undefined,{docType:'FOOTPRINT',uuid:'fp'}),
+    record('VIA','v',{centerX:20,centerY:10,holeDiameter:12,viaDiameter:20,viaType:'NORMAL',netName:''})
+  ].join('\n');
+  const via=base.objects.Via[0],parent=base.objects.Component[0];
+  const viaSource={centerX:via.X,centerY:via.Y,netName:via.Net};
+  base.records.push(['VIA','Uv',viaSource]);
+  const m=await transactionFixture(base), plan=m.plan;
+  plan.add.traces=[];
+  plan.target_board.routes.traces=[];
+  const pose={id:'U',x:105,y:100,rotation:0,layer:1};
+  plan.components.push(pose);
+  Object.assign(plan.target_board.components[0],pose);
+  plan.target_board.routes.vias[0].x+=5;
+  m.eda.pcb_PrimitiveComponent.get=async()=>({
+    getState_PrimitiveLock:()=>false,
+    toAsync:()=>({
+      setState_X:x=>{parent.X=x;m.records.find(row=>row[0]==='COMPONENT')[2].x=x;},
+      setState_Y:()=>{},setState_Rotation:()=>{},setState_Layer:()=>{},
+      done:async()=>{
+        via.X+=5;via.Net='EXTERNAL';
+        viaSource.centerX=via.X;viaSource.netName=via.Net;
+        return true;
+      }
+    })
+  });
+  const result=await m.apply();
+  assert.equal(result.error.code,'READBACK_FAILED');
+  assert.equal(result.recovery_required,true);
+  assert.equal(m.state.journal.status,'recovery_required');
+  assert.equal(m.state.restores,0);
+  assert.equal(via.Net,'EXTERNAL');
+});
+
+test('原生保存期间线端从 130 改为 135，回执不把旧几何判作成功',async()=>{
+  const m=await transactionFixture();
+  m.eda.pcb_Document.save=async()=>{
+    m.state.saves++;
+    await Promise.resolve();
+    m.objects.Line.at(-1).EndX=135;
+    m.records.at(-1)[2].endX=135;
+    return true;
+  };
+  const result=await m.apply();
+  assert.equal(result.success,false);
+  assert.equal(result.saved,false);
+  assert.equal(result.save_acknowledged,true);
+  assert.equal(result.recovery_required,true);
+  assert.equal(m.state.journal.status,'recovery_required');
+  assert.equal(m.state.saves,1);
+  assert.equal(m.state.restores,0);
+  assert.equal(m.objects.Line.at(-1).EndX,135);
+});
+
+test('保存后即使源指纹相同也要核对实际 API 几何及活动 PCB 身份',async()=>{
+  for(const change of ['geometry','uuid']){
+    const m=await transactionFixture();
+    m.eda.pcb_Document.save=async()=>{
+      if(change==='geometry')m.objects.Line.at(-1).EndX=135;
+      else m.eda.dmt_SelectControl.getCurrentDocumentInfo=async()=>({uuid:'another-board',documentType:3});
+      return true;
+    };
+    const result=await m.apply();
+    assert.equal(result.success,false);
+    assert.equal(result.save_acknowledged,true);
+    assert.equal(result.recovery_required,true);
+    assert.equal(m.state.restores,0);
+  }
+});
+
+test('未发生并发编辑的写回仍支持保存及原生 DRC 失败回滚',async()=>{
+  const m=await transactionFixture(),saved=await m.apply();
+  assert.equal(saved.success,true);
+  assert.equal(saved.saved,true);
+  assert.equal(saved.source.fingerprint,sourceFingerprint(await m.eda.sys_FileManager.getDocumentSource()));
+  assert.equal(m.state.journal.status,'applied');
+  const n=await transactionFixture();
+  n.eda.pcb_Drc.check=async()=>[{rule:'spacing'}];
+  const failed=await n.apply();
+  assert.equal(failed.error.code,'NATIVE_DRC_FAILED');
+  assert.equal(failed.rollback.restored,true);
+  assert.equal(n.state.restores,1);
+  assert.equal(n.state.saves,0);
+  assert.equal(n.state.journal.status,'failed');
+});
 
 test('板框用同源四位小数编码闭环，原始 getter 保持不变并输出差异证据',async()=>{
   const m=fixture(),before=clone(m.objects);const b=await exportBoard(m.eda,m.context);

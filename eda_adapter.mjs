@@ -1069,17 +1069,51 @@ export async function readApplyJob(eda,jobKey){
   if(job.status==='final'&&typeof job.result?.success!=='boolean')fail('INVALID_JOB_STATE','Final job must retain the complete apply result');
   return copy(job);
 }
-/** Applies a reviewed, verified plan. Native DRC failure triggers source restoration. */
+/** 输入写前和当前的完整原文、已成功执行的动作、已实测的派生铜和随父件移动的焊盘及孔。
+ * 返回是否只有本事务涉及的原生记录发生变化。遇到无法解释的记录保留现场，由调用方处理恢复。
+ */
+function rollbackChangesAccountedFor(original,current,events,derivedCopper,movedFootprintParts){
+  const added=new Set(derivedCopper.map(id=>'TEARDROP/'+id)),removed=new Set(),moved=new Set();
+  for(const event of events){
+    if(event.kind==='create')added.add(event.type.toUpperCase()+'/'+event.id);
+    if(event.kind==='remove')removed.add(event.type.toUpperCase()+'/'+event.id);
+    if(event.kind==='move')moved.add(event.id);
+  }
+  const retained=(source,omitted)=>sourceRows(source).flatMap(row=>{
+    const {type,id}=row.header;
+    if(omitted.has(type+'/'+id))return [];
+    if((type==='COMPONENT'&&moved.has(id))||movedFootprintParts.has(type+'/'+id)){
+      if(row.legacy)return [row.line];
+      const split=row.line.indexOf('||')+2,end=row.line.trim().endsWith('|')?row.line.lastIndexOf('|'):row.line.length;
+      const pose=type==='VIA'?['centerX','centerY','X','Y']:['x','y','positionX','positionY','angle','layerId','X','Y','Rotation','Layer'];
+      return [row.line.slice(0,split)+withoutObjectFields(row.line.slice(split,end),pose,'原生姿态')+row.line.slice(end)];
+    }
+    return [row.line];
+  }).join('\n');
+  return sourceFingerprint(retained(original,removed))===sourceFingerprint(retained(current,added));
+}
+
+/** 输入已审查计划、当前嘉立创接口和可选保存标志。返回一次执行的回执和恢复状态。
+ * 计划格式异常会抛错。执行中出现并发修改或保存结果无法核对时，保留现场及原备份。
+ */
 export async function applyPlan(eda, plan, opts={}) {
   validatePlan(plan);
   const uuid=plan.source.document_uuid, key='pcb_pipeline:journal:'+uuid, transaction=uuid+':'+plan.plan_id;
   if(inflight.has(uuid))fail('TRANSACTION_BUSY','Another apply is running for this PCB');
   inflight.add(uuid);
-  let original, journal, edited=false, drc=null,generatedNativeCopper;
+  let original, journal, edited=false, drc=null,generatedNativeCopper,readbackFingerprint;
+  let saveState='not_requested';
+  const derivedCopper=[],movedFootprintParts=new Set();
   const events=[];
   const event=(kind,data={})=>events.push({kind,...data});
   const store=async()=>{
     if(await eda.sys_Storage.setExtensionUserConfig(key,journal)!==true)fail('JOURNAL_FAILED','Could not durably write extension journal');
+  };
+  const checkCurrentSource=async phase=>{
+    await activeDocument(eda,uuid);
+    const currentFingerprint=sourceFingerprint(await readSource(eda));
+    await activeDocument(eda,uuid);
+    if(currentFingerprint!==readbackFingerprint)fail('BOARD_CHANGED',phase,{expected_fingerprint:readbackFingerprint,current_fingerprint:currentFingerprint});
   };
   try {
     if(opts.context?.board?.usage==='test_only')fail('TEST_ONLY_GEOMETRY','A test-only boundary cannot authorize native writes');
@@ -1163,6 +1197,9 @@ export async function applyPlan(eda, plan, opts={}) {
       await activeDocument(eda,uuid);edited=true;
       const a=prim.toAsync();a.setState_X(c.x);a.setState_Y(c.y);a.setState_Rotation(c.rotation);a.setState_Layer(c.layer);
       if(!await a.done())fail('API_WRITE_FAILED','Component done() failed '+c.id);
+      const parent=before.components.find(component=>component.id===c.id);
+      for(const pad of parent.pads)movedFootprintParts.add('PAD/'+pad.padId);
+      for(const v of attachedTargets)if(v.metadata.parent_component_id===c.id)movedFootprintParts.add('VIA/'+v.id);
       event('move',{id:c.id});await store();
     }
     for(const {type,pid} of removals) {
@@ -1177,6 +1214,11 @@ export async function applyPlan(eda, plan, opts={}) {
       created.push({type,id:id(p),args});event('create',{type,id:id(p)});await store();
     }
     const after=await exportBoard(eda,{...opts.context,document_uuid:uuid});
+    readbackFingerprint=after.metadata.source.fingerprint;
+    const addedIds=new Set(created.filter(item=>item.type==='Line'||item.type==='Via').map(item=>item.id));
+    for(const p of after.routes.copper_pours){
+      if(p.source_kind==='Teardrop'&&!originalTeardrops.some(t=>t.id===p.id)&&p.metadata.refs.some(ref=>addedIds.has(ref)))derivedCopper.push(p.id);
+    }
     for(const c of plan.components) {
       const actual=after.components.find(x=>x.id===c.id);
       if(!actual||!['x','y','rotation','layer'].every(k=>actual[k]===c[k]))fail('READBACK_FAILED','Component readback mismatch '+c.id);
@@ -1233,20 +1275,46 @@ export async function applyPlan(eda, plan, opts={}) {
         fail('TARGET_MISMATCH','Native readback differs from target_board geometry');
       }
     }
-    drc=await runNativeDrc(eda,uuid);event('native_drc',{passed:drc.passed,issues:drc.issues});
+    const nativeDrc=await runNativeDrc(eda,uuid);
+    event('native_drc',{passed:nativeDrc.passed,issues:nativeDrc.issues});
+    await checkCurrentSource('原生 DRC 期间文档已改变');
+    drc={...nativeDrc,source:after.metadata.source};
     if(!drc.passed)fail('NATIVE_DRC_FAILED','Native DRC returned issues');
-    if(sourceFingerprint(await readSource(eda))!==after.metadata.source.fingerprint)fail('BOARD_CHANGED','Document changed during native DRC; refusing to save');
-    journal.status='applied';journal.result_fingerprint=after.metadata.source.fingerprint;await store();
-    let saved=false;
-    if(opts.save===true){await activeDocument(eda,uuid);if(sourceFingerprint(await readSource(eda))!==after.metadata.source.fingerprint)fail('BOARD_CHANGED','Document changed before save');if(await eda.pcb_Document.save()!==true)fail('SAVE_FAILED','Native save failed or upload failed');saved=true;event('save');}
-    return {success:true,applied:true,saved,plan_id:plan.plan_id,document_uuid:uuid,source:after.metadata.source,drc,events,backup_storage_key:key,live_board_validated:false};
+    let verified=after;
+    if(opts.save===true){
+      await checkCurrentSource('原生保存前文档已改变');
+      saveState='pending';
+      if(await eda.pcb_Document.save()!==true){
+        saveState='rejected';
+        fail('SAVE_FAILED','Native save failed or upload failed');
+      }
+      saveState='acknowledged';
+      event('save');
+      await checkCurrentSource('原生保存期间文档已改变');
+      verified=await exportBoard(eda,{...opts.context,document_uuid:uuid});
+      if(verified.metadata.source.fingerprint!==readbackFingerprint||boardGeometrySignature(verified)!==boardGeometrySignature(after)){
+        fail('READBACK_FAILED','保存后的实际板面与已核对的目标板面不同');
+      }
+    }
+    journal.status='applied';journal.save_state=saveState;journal.result_fingerprint=verified.metadata.source.fingerprint;await store();
+    await checkCurrentSource('写回收据持久化期间文档已改变');
+    return {success:true,applied:true,saved:saveState==='acknowledged',save_acknowledged:saveState==='acknowledged',plan_id:plan.plan_id,document_uuid:uuid,source:verified.metadata.source,drc,events,backup_storage_key:key,live_board_validated:false};
   } catch(error) {
     const result={success:false,applied:false,saved:false,plan_id:plan.plan_id,error:{code:error.code??'API_ERROR',message:error.message,details:error.details??{}},drc,events,rollback:{attempted:false,restored:false},backup_storage_key:journal?key:null};
+    result.save_acknowledged=saveState==='acknowledged';
     if(generatedNativeCopper)result.generated_native_copper=generatedNativeCopper;
-    if(edited&&original!==undefined) {
-      result.rollback.attempted=true;
+    const preserve=saveState==='pending'||result.save_acknowledged||['BOARD_CHANGED','WRONG_DOCUMENT'].includes(error.code);
+    if(edited&&original!==undefined&&!preserve) {
       try {
         await activeDocument(eda,uuid);
+        const current=await readSource(eda), currentFingerprint=sourceFingerprint(current);
+        if((readbackFingerprint&&currentFingerprint!==readbackFingerprint)||
+           !rollbackChangesAccountedFor(original,current,events,derivedCopper,movedFootprintParts)){
+          fail('BOARD_CHANGED','回滚前发现无法归属于本次操作的变化');
+        }
+        await activeDocument(eda,uuid);
+        if(sourceFingerprint(await readSource(eda))!==currentFingerprint)fail('BOARD_CHANGED','准备回滚时文档再次改变');
+        result.rollback.attempted=true;
         if(await eda.sys_FileManager.setDocumentSource(original)!==true)fail('ROLLBACK_FAILED','setDocumentSource rejected backup');
         const proof=verifyRollbackSource(original,await readSource(eda));
         if(!proof.restored)fail('ROLLBACK_FAILED','Backup readback differs',{verification:proof});
@@ -1255,7 +1323,15 @@ export async function applyPlan(eda, plan, opts={}) {
         event('rollback',{restored:true,verification:proof.verification,source_fingerprint:proof.source_fingerprint,requires_reexport:proof.requires_reexport});
       }catch(rollbackError){result.rollback.error=rollbackError.message;event('rollback',{restored:false,error:rollbackError.message});}
     }
-    if(journal){journal.status=result.rollback.attempted&&!result.rollback.restored?'recovery_required':'failed';journal.failure=result.error;try{await store();}catch(e){result.journal_error=e.message;}}
+    result.recovery_required=!!journal&&((edited&&!result.rollback.restored)||saveState==='pending'||result.save_acknowledged);
+    if(result.recovery_required)event('recovery_required',{reason:result.rollback.error??result.error.message,save_state:saveState});
+    if(journal){
+      journal.status=result.recovery_required?'recovery_required':'failed';
+      delete journal.result_fingerprint;
+      journal.save_state=saveState;journal.failure=result.error;
+      if(readbackFingerprint)journal.readback_fingerprint=readbackFingerprint;
+      try{await store();}catch(e){result.journal_error=e.message;}
+    }
     return result;
   } finally {inflight.delete(uuid);}
 }
